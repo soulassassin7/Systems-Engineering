@@ -1,0 +1,259 @@
+#include <iostream>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <vector>
+#include <fcntl.h>
+#include <cerrno>
+#include <sys/epoll.h>
+#include <cstring> // for strlen()
+#include <sys/sendfile.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdio.h> // for sscanf()
+#include <filesystem> // For checking if file exists (optional, but good)
+#include <unordered_map>
+#include "day25_ThreadPool.h"
+namespace fs = std::filesystem;
+
+// Your clean helper function
+std::string get_mime_type(std::string extension){
+    static const std::unordered_map<std::string,std::string> mp = {
+        {".html", "text/html"},
+        {".css", "text/css"},
+        {".js", "application/javascript"},
+        {".png", "image/png"},
+        {".jpg", "image/jpeg"},
+        {".gif", "image/gif"}
+    };
+    
+    if(mp.count(extension)) return mp.at(extension);
+    return "text/plain";
+}
+
+int main(){
+	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if(server_fd == -1){
+		std::cout<<"Socket creation failed"<<std::endl;
+		return -1;
+	}
+	
+	int opt = 1; // Add this to allow restarting immediately
+    	setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+	
+	struct sockaddr_in address;
+	address.sin_family = AF_INET;
+	address.sin_port = htons(8080);
+	address.sin_addr.s_addr = INADDR_ANY;
+
+	if(bind(server_fd,(sockaddr*)&address,sizeof(address))<0){
+		std::cout<<"Binding failed"<<std::endl;
+		return -1;
+	}
+	
+	if(listen(server_fd,20)<0){
+		std::cout<<"Listening failed"<<std::endl;
+		return -1;
+	}
+	
+	std::cout<<"Listening on port 8080"<<std::endl;
+
+		/*
+	* THE "SINGLE WAITER" ANALOGY (Why we use Non-Blocking I/O)
+	* ---------------------------------------------------------
+	* Concept: This server is Single-Threaded. It is like a Restaurant with only ONE Waiter.
+	* If the Waiter stops to sleep (Block) for even 1 second, EVERY customer waits.
+	*
+	* 1. Why Server Socket (The Door) is Non-Blocking:
+	* - The Trap: "The Phantom Knock." A client connects but disconnects immediately.
+	* - Blocking: The Waiter stands at the open door staring into space, waiting for a
+	* replacement guest, while customers at tables (connected clients) starve.
+	* - Non-Blocking: The Waiter checks the door. If no one is there, they immediately
+	* turn around to serve existing tables.
+	*
+	* 2. Why Client Socket (The Conversation) is Non-Blocking:
+	* - The Trap: "The Slow Talker." A client sends 5 bytes of a 1000-byte message.
+	* - Blocking: The Waiter stands at that table, frozen, refusing to move until the
+	* client finishes the sentence. The entire restaurant freezes.
+	* - Non-Blocking: The Waiter takes the 5 bytes, writes them down, serves other tables,
+	* and comes back later for the rest.
+ 	*/
+	
+	fcntl(server_fd,F_SETFL, O_NONBLOCK); // making the accept at server_fd as non-blocking
+
+	long long count = 1;
+	std::vector<int> client_fds;
+	
+	int epoll_fd = epoll_create1(0); // 0 means default options
+	// this creates an event manager used to keep track of sockets
+	// this allocates space in memory to hold a list of sockets to watch
+	//epoll_id is the file descriptor used to talk to the manager
+	
+	//epoll form
+	struct epoll_event event;
+	event.events = EPOLLIN; // What we are waiting for? Epoll Input, "wake me up when data comes IN
+	event.data.fd =  server_fd; // which socket is this event for
+
+	// registrering the form (event)
+	if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,server_fd,&event) == -1){
+		std::cout<<"Epoll creation failed"<<std::endl;	// EPOLL_CTL_ADD is for the action which is ADDING new socket here
+	}							// to the list, we can use EPOLL_CTL_DEL to delete one later
+								// we are adding server_fd socket
+	
+	std::cout<<"Epoll created"<<std::endl;
+	
+	struct epoll_event events[10];
+
+	/* 
+	Blocking server_fd: Blocking server_fd freezes the server if the server has other work to do while waiting.
+	Blocking client_fd: Freezes the server if the current user is slow.
+	*/
+	
+	ThreadPool pool(4);
+
+	while(true){
+		int num_events = epoll_wait(epoll_fd,events,10,-1); // this line pauses the program and waits for events consuming 0% cpu
+		// it only returns when something happens, -1 is to indicate wait forever until an event occurs
+		for(int i = 0; i<num_events; ++i){
+			if(events[i].data.fd == server_fd){
+						struct sockaddr_in client_address;
+						socklen_t client_len = sizeof(client_address);
+
+						int client_fd = accept(server_fd,(sockaddr*)&client_address,&client_len); // this accept is non-blocking 
+																								  // if no client connects the control
+																								  // goes forward continuously
+																								// as the accept immediately returns 
+																								// even with no clients
+
+						if(client_fd >= 0){
+							fcntl(client_fd,F_SETFL,O_NONBLOCK);
+
+							struct epoll_event client_event;
+							client_event.events = EPOLLIN; // watch for the data from this guest
+							client_event.data.fd = client_fd;
+							if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,client_fd,&client_event)<0){ // when the control goes out of if block
+								std::cout<<"Client fd registration failed"<<std::endl;   // the stack variable client_event is destroyed
+							}	// the manager(epoll_fd) makes the copy of this event in the kernel memory and keeps track of the client_fd
+							// even thought the event structure is destroyed
+							// think of the struct declaration as piece of paper 
+							std::cout<<"Client fd registered"<<std::endl;
+							
+
+							client_fds.push_back(client_fd);
+							std::cout<<"Client connected! "<<client_fd<<" the number of clients is "<<client_fds.size()<<std::endl;
+
+						} else {
+							if(errno == EWOULDBLOCK || errno == EAGAIN){
+									std::cout<<"Non-Blocking"<<std::endl;
+							} else {
+								// Something BAD happened!
+								perror("Accept Error"); // Prints the exact error string
+								return 0;
+							}
+						}
+			} else{
+				int client_fd = events[i].data.fd;
+				char buffer[1024] = {0};
+
+				int bytes_read = read(client_fd,buffer,1024);
+
+				if(bytes_read > 0){
+                    std::cout << "Client " << client_fd << " says: \n" << buffer << std::endl;
+
+                    // 1. WRAP: Turn raw bytes into C++ string for easy parsing
+                    std::string req(buffer, bytes_read);
+                    std::stringstream ss(req);
+                    std::string method, path;
+                    ss >> method >> path; // Easy parsing!
+
+                    // 2. LOGIC: Handle the path (C++ style)
+                    if (path == "/") path = "/index.html";
+
+		    if (path == "/heavy") {
+                        std::cout << "Main Thread: Offloading heavy task for FD " << client_fd << std::endl;
+
+                        // A. REMOVE from Epoll (The Handoff)
+                        // We must stop watching this FD, or Epoll might trigger again while the worker is using it.
+                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
+
+                        // B. ENQUEUE to Thread Pool
+                        // We capture 'client_fd' by value so the worker knows who to talk to.
+                        pool.enqueue([client_fd] {
+                            // --- WORKER THREAD STARTS HERE ---
+                            std::cout << "Worker: Crunching numbers..." << std::endl;
+                            
+                            // Simulate Heavy Work (5 seconds)
+                            std::this_thread::sleep_for(std::chrono::seconds(5));
+                            
+                            // Send Response
+                            std::string msg = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHeavy Done!\r\n";
+                            send(client_fd, msg.c_str(), msg.length(), 0);
+                            
+                            // Close Connection (Worker finishes the job)
+                            close(client_fd);
+                            std::cout << "Worker: Finished FD " << client_fd << std::endl;
+                            // --- WORKER THREAD ENDS HERE ---
+                        });
+
+                        // C. Main Thread continues immediately!
+                        // We do NOT close(client_fd) here. The worker will do it.
+                        continue; 
+                    }
+
+                    // Remove the leading slash to find the file locally
+                    // "/index.html" -> "index.html"
+                    std::string filepath = path.substr(1); 
+
+                    // 3. OPEN: Back to C style for the system call
+                    int file_fd = open(filepath.c_str(), O_RDONLY);
+                    
+                    if(file_fd < 0) {
+                        // 404 Logic
+                        std::string not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                        send(client_fd, not_found.c_str(), not_found.length(), 0);
+                        close(client_fd);
+                        continue;
+                    }
+
+                    // 4. PREPARE: Get size and type
+                    struct stat file_stat;
+                    fstat(file_fd, &file_stat);
+                    
+                    // Use your clean C++ helper!
+                    // fs::path(filepath).extension() requires <filesystem>, 
+                    // or you can just extract the string manually if you prefer.
+                    std::string extension = fs::path(filepath).extension().string();
+                    std::string mime_type = get_mime_type(extension);
+
+                    // 5. HEADERS: Build with C++ string (so much easier)
+                    std::string headers = 
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: " + mime_type + "\r\n"
+                        "Content-Length: " + std::to_string(file_stat.st_size) + "\r\n"
+                        "\r\n";
+
+                    // 6. SEND: The Header (RAM) + The Body (Disk -> Network)
+                    send(client_fd, headers.c_str(), headers.length(), 0);
+                    sendfile(client_fd, file_fd, NULL, file_stat.st_size);
+                    
+                    std::cout << "Served: " << filepath << " (" << mime_type << ")" << std::endl;
+                    
+                    close(file_fd);
+                    close(client_fd);
+                } else if(bytes_read == 0){
+					std::cout<<"Client "<<client_fd<<" disconnected."<<std::endl;
+					close(client_fd);
+				} else{
+					if(errno == EAGAIN || errno == EWOULDBLOCK){
+						// FALSE alarm, ignore
+					} else{
+						perror("Read error");
+						close(client_fd);
+					}
+				}
+			}
+		}
+	}
+	return 0;
+}

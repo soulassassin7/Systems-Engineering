@@ -1,0 +1,29 @@
+CXX = g++
+CXXFLAGS = -Wall -pthread
+
+#1. Default target definition
+# when we type 'make', it builds this
+
+all: server
+
+#2. Linking
+#create the final executable 'server' by combining object files
+server: main.o Server.o
+	$(CXX) $(CXXFLAGS) -o server main.o Server.o
+
+
+#3 Compiling main
+# Creates main.o
+# The '-c' flag means "compile only, don't link yet"
+main.o: day21_main.cpp day21_Server.h
+	$(CXX) $(CXXFLAGS) -c day21_main.cpp -o main.o
+
+#4 Compiling server.cpp
+# creates Server.o
+Server.o: day21_Server.cpp day21_Server.h
+	$(CXX) $(CXXFLAGS) -c day21_Server.cpp -o Server.o
+
+#5 cleanup
+#
+clean:
+	rm -f *.o server

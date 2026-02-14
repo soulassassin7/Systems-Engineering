@@ -1,0 +1,231 @@
+#include <iostream>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <vector>
+#include <fcntl.h>
+#include <cerrno>
+#include <sys/epoll.h>
+#include <cstring> // for strlen()
+#include <sys/sendfile.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+
+int main(){
+	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if(server_fd == -1){
+		std::cout<<"Socket creation failed"<<std::endl;
+		return -1;
+	}
+	
+	int opt = 1; // Add this to allow restarting immediately
+    	setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+	
+	struct sockaddr_in address;
+	address.sin_family = AF_INET;
+	address.sin_port = htons(8080);
+	address.sin_addr.s_addr = INADDR_ANY;
+
+	if(bind(server_fd,(sockaddr*)&address,sizeof(address))<0){
+		std::cout<<"Binding failed"<<std::endl;
+		return -1;
+	}
+	
+	if(listen(server_fd,20)<0){
+		std::cout<<"Listening failed"<<std::endl;
+		return -1;
+	}
+	
+	std::cout<<"Listening on port 8080"<<std::endl;
+
+		/*
+	* THE "SINGLE WAITER" ANALOGY (Why we use Non-Blocking I/O)
+	* ---------------------------------------------------------
+	* Concept: This server is Single-Threaded. It is like a Restaurant with only ONE Waiter.
+	* If the Waiter stops to sleep (Block) for even 1 second, EVERY customer waits.
+	*
+	* 1. Why Server Socket (The Door) is Non-Blocking:
+	* - The Trap: "The Phantom Knock." A client connects but disconnects immediately.
+	* - Blocking: The Waiter stands at the open door staring into space, waiting for a
+	* replacement guest, while customers at tables (connected clients) starve.
+	* - Non-Blocking: The Waiter checks the door. If no one is there, they immediately
+	* turn around to serve existing tables.
+	*
+	* 2. Why Client Socket (The Conversation) is Non-Blocking:
+	* - The Trap: "The Slow Talker." A client sends 5 bytes of a 1000-byte message.
+	* - Blocking: The Waiter stands at that table, frozen, refusing to move until the
+	* client finishes the sentence. The entire restaurant freezes.
+	* - Non-Blocking: The Waiter takes the 5 bytes, writes them down, serves other tables,
+	* and comes back later for the rest.
+ 	*/
+	
+	fcntl(server_fd,F_SETFL, O_NONBLOCK); // making the accept at server_fd as non-blocking
+
+	long long count = 1;
+	std::vector<int> client_fds;
+	
+	int epoll_fd = epoll_create1(0); // 0 means default options
+	// this creates an event manager used to keep track of sockets
+	// this allocates space in memory to hold a list of sockets to watch
+	//epoll_id is the file descriptor used to talk to the manager
+	
+	//epoll form
+	struct epoll_event event;
+	event.events = EPOLLIN; // What we are waiting for? Epoll Input, "wake me up when data comes IN
+	event.data.fd =  server_fd; // which socket is this event for
+
+	// registrering the form (event)
+	if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,server_fd,&event) == -1){
+		std::cout<<"Epoll creation failed"<<std::endl;	// EPOLL_CTL_ADD is for the action which is ADDING new socket here
+	}							// to the list, we can use EPOLL_CTL_DEL to delete one later
+								// we are adding server_fd socket
+	
+	std::cout<<"Epoll created"<<std::endl;
+	
+	struct epoll_event events[10];
+
+	/* 
+	Blocking server_fd: Blocking server_fd freezes the server if the server has other work to do while waiting.
+	Blocking client_fd: Freezes the server if the current user is slow.
+	*/
+
+	while(true){
+		int num_events = epoll_wait(epoll_fd,events,10,-1); // this line pauses the program and waits for events consuming 0% cpu
+		// it only returns when something happens, -1 is to indicate wait forever until an event occurs
+		for(int i = 0; i<num_events; ++i){
+			if(events[i].data.fd == server_fd){
+						struct sockaddr_in client_address;
+						socklen_t client_len = sizeof(client_address);
+
+						int client_fd = accept(server_fd,(sockaddr*)&client_address,&client_len); // this accept is non-blocking 
+																								  // if no client connects the control
+																								  // goes forward continuously
+																								// as the accept immediately returns 
+																								// even with no clients
+
+						if(client_fd >= 0){
+							fcntl(client_fd,F_SETFL,O_NONBLOCK);
+
+							struct epoll_event client_event;
+							client_event.events = EPOLLIN; // watch for the data from this guest
+							client_event.data.fd = client_fd;
+							if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,client_fd,&client_event)<0){ // when the control goes out of if block
+								std::cout<<"Client fd registration failed"<<std::endl;   // the stack variable client_event is destroyed
+							}	// the manager(epoll_fd) makes the copy of this event in the kernel memory and keeps track of the client_fd
+							// even thought the event structure is destroyed
+							// think of the struct declaration as piece of paper 
+							std::cout<<"Client fd registered"<<std::endl;
+							
+
+							client_fds.push_back(client_fd);
+							std::cout<<"Client connected! "<<client_fd<<" the number of clients is "<<client_fds.size()<<std::endl;
+
+						} else {
+							if(errno == EWOULDBLOCK || errno == EAGAIN){
+									std::cout<<"Non-Blocking"<<std::endl;
+							} else {
+								// Something BAD happened!
+								perror("Accept Error"); // Prints the exact error string
+								return 0;
+							}
+						}
+			} else{
+				int client_fd = events[i].data.fd;
+				char buffer[1024] = {0};
+
+				int bytes_read = read(client_fd,buffer,1024);
+
+				if(bytes_read > 0){
+					std::cout<<"Client "<< client_fd<<" says: " <<buffer<< std::endl;
+					const char* http_response;
+					if(strstr(buffer, "GET / ") != NULL){
+                                    		int file_fd = open("index.html", O_RDONLY);
+                                    		if(file_fd < 0){
+                                        		std::cout << "Could not open the file" << std::endl;
+                                        		// In real life, send a 404 here
+                                        		continue;
+                                    		}
+
+                                    		// FIX 1: Correct fstat usage
+                                    		struct stat file_stat;
+                                    		if(fstat(file_fd, &file_stat) < 0) {
+                                        		std::cout << "Fstat failed" << std::endl;
+                                        		close(file_fd);
+                                        		continue;
+                                    		}
+
+                                    		// FIX 2: Correct String formatting
+                                    		char header[1024] = {0};
+                                    		sprintf(header, 
+                                        		"HTTP/1.1 200 OK\r\n"
+                                        		"Content-Type: text/html\r\n"
+                                        		"Content-Length: %ld\r\n"
+                                        		"\r\n", // FIX 3: The crucial blank line!
+                                        		file_stat.st_size
+                                    		);
+
+		                            	// Send headers
+                	                    send(client_fd, header, strlen(header), 0);
+
+                	                    // Send body (Zero-Copy)
+                        	            // NULL is valid for offset (uses current position)
+										
+										/* In previous servers we had 
+											The Bottleneck: "The Double Copy"
+											Look at this section of your old code:
+											std::stringstream buffer;
+											buffer << file.rdbuf();      // 1. COPY: Load entire file from Disk to RAM
+											std::string body = buffer.str(); 
+											// ...
+											send(..., body.c_str(), ...); // 2. COPY: Copy from RAM to Network Card
+											Why this fails at High Scale:
+
+											RAM Usage: If a user requests a 1GB video file, your server attempts to malloc 1GB of RAM to 
+											hold that string. If 10 users connect, your server crashes (Out of Memory).
+
+											CPU Waste: The CPU has to manually read every byte from the disk and 
+											write it into the string. This burns CPU cycles that could be used to handle other clients.
+										
+										*/
+                                	    sendfile(client_fd, file_fd, NULL, file_stat.st_size); 
+										/*
+											RAM Usage: Zero. The file is never loaded into your program's memory.
+
+											CPU Usage: Near Zero. The Kernel tells the Disk Controller to send data directly to the Network Card (DMA).
+										*/
+                                    
+                                    	std::cout << "Served index.html via sendfile" << std::endl;
+                                    	close(file_fd);
+					    continue;
+                                	}	
+					else if (strstr(buffer, "GET /about ") != NULL) {
+                        			http_response = 
+                           				"HTTP/1.1 200 OK\r\n"
+                            				"Content-Type: text/html\r\n\r\n"
+                            				"<html><body><h1>About Me</h1><p>I built this event loop from scratch in C++.</p></body></html>";
+                    			} else{
+						http_response =
+							"HTTP/1.1 404 Not Found\r\n"
+                            				"Content-Type: text/html\r\n\r\n"
+                            				"<html><body><h1 style='color:red'>404 Error</h1><p>Page not found!</p></body></html>";
+					}
+					send(client_fd,http_response,strlen(http_response),0);
+					close(client_fd);
+
+				} else if(bytes_read == 0){
+					std::cout<<"Client "<<client_fd<<" disconnected."<<std::endl;
+					close(client_fd);
+				} else{
+					if(errno == EAGAIN || errno == EWOULDBLOCK){
+						// FALSE alarm, ignore
+					} else{
+						perror("Read error");
+						close(client_fd);
+					}
+				}
+			}
+		}
+	}
+	return 0;
+}
